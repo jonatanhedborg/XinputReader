@@ -46,6 +46,19 @@ Some things worth knowing:
 * Afterwards use the playback, not *Monitor Controller*, to watch the take. Monitoring writes the live controller values over the recorded ones as it runs.
 * Recording samples the controller as fast as the modal operator is served and keys the newest values on each new frame, so a take is as smooth as the playback that captured it. If the playback drops below the scene frame rate you get keys on the frames that were actually played.
 
+# Rigid bodies
+
+Blender does not notice when a rigid body constraint is changed by a driver. The simulated frames it already has are replayed exactly as they were, so a second take looks identical to the first one and the simulation appears stuck. Emptying the point cache does not help either, which is what the two buttons under *Rigid Body Cache* are for:
+
+* **Free** throws the simulated frames away, so playing again simulates from scratch. Use it after changing anything the controller drives.
+* **Bake** does the same and then simulates the whole scene frame range in one go. Only a baked simulation can be scrubbed or rendered out of order, since jumping to a frame never simulates anything by itself.
+
+*Bake* also sets the cache frame range to the scene frame range. The rigid body cache keeps a range of its own, which starts out as 1 to 250 no matter how long the scene is, and the simulation stops dead at the end of it.
+
+Recording resets the simulation on its own when *Start From First Frame* is on, so each take is simulated from its beginning with the inputs you are giving it. Recording onto the end of an earlier take cannot do that and says so, since the simulation of the earlier frames is only in the cache.
+
+If you know Blender's physics internals: what actually resets the cache is writing one of the rigid body world's own settings, so the add-on writes `substeps_per_frame` back onto itself. `ptcache.free_bake` alone does not do it.
+
 # Platforms
 
 | | how the gamepad is read |

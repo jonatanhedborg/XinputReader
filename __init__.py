@@ -76,6 +76,32 @@ def refresh_devices():
     _devices = None
 
 
+def rigid_body_cache(scene):
+    """The point cache of the scene's rigid body world, if it has one."""
+    world = scene.rigidbody_world
+    return world.point_cache if world else None
+
+
+def reset_rigid_body(context):
+    """Throw away the simulated frames, returns False without a rigid body world.
+
+    Blender does not notice when a constraint is changed by a driver, so the
+    simulation is replayed from the cache exactly as it was and looks stuck on
+    the previous take. Emptying the point cache does not help by itself:
+    writing one of the world's own settings, even the very same value back, is
+    what actually makes it simulate again.
+    """
+    world = context.scene.rigidbody_world
+    if world is None:
+        return False
+
+    with context.temp_override(point_cache=world.point_cache):
+        bpy.ops.ptcache.free_bake()
+
+    world.substeps_per_frame = world.substeps_per_frame
+    return True
+
+
 def get_preferences(context):
     addon = context.preferences.addons.get(__package__)
     return addon.preferences if addon else None
@@ -298,6 +324,15 @@ class XR_OT_monitor_controller(Operator):
             self.report({'INFO'}, "Added the XInput Reader empty to the scene "
                                   "so that its keyframes play back")
 
+        if self.from_start:
+            # A new take has to be simulated from the beginning, the frames of
+            # the previous one would otherwise be replayed over it.
+            if reset_rigid_body(context):
+                self.report({'INFO'}, "Reset the rigid body simulation")
+        elif rigid_body_cache(scene) is not None:
+            self.report({'WARNING'}, "Recording onto the end of a take leaves "
+                                     "the simulation on the earlier frames")
+
         if self.clear_previous:
             clear_recording(xinput_reader_empty)
 
@@ -340,6 +375,67 @@ class XR_OT_monitor_controller(Operator):
         if self._gamepad is not None:
             self._gamepad.close()
             self._gamepad = None
+
+
+class XR_OT_rigid_body_cache(Operator):
+    bl_idname = "wm.rigid_body_cache"
+    bl_label = "Rigid Body Cache"
+    bl_options = {'REGISTER'}
+
+    bake: bpy.props.BoolProperty(
+        name="Bake",
+        description="Simulate the whole frame range instead of only freeing",
+        default=True,
+        options={'SKIP_SAVE'},
+    )
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.bake:
+            return ("Throw the rigid body cache away and simulate the whole "
+                    "scene frame range again, so that scrubbing and rendering "
+                    "match the recorded inputs")
+        return ("Throw the rigid body cache away, so that the simulation "
+                "responds to the controller again")
+
+    @classmethod
+    def poll(cls, context):
+        return rigid_body_cache(context.scene) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        cache = rigid_body_cache(scene)
+
+        if context.window_manager.modal_running:
+            self.report({'ERROR'}, "Stop reading the controller first, it would "
+                                   "write over the simulated frames")
+            return {'CANCELLED'}
+
+        if not scene.rigidbody_world.enabled:
+            self.report({'WARNING'}, "The rigid body world is disabled")
+
+        frame = scene.frame_current
+
+        reset_rigid_body(context)
+
+        if not self.bake:
+            self.report({'INFO'}, "Freed the rigid body cache")
+            return {'FINISHED'}
+
+        # The cache keeps a frame range of its own, which does not follow the
+        # scene, and the simulation stops dead at the end of it.
+        cache.frame_start = scene.frame_start
+        cache.frame_end = scene.frame_end
+
+        with context.temp_override(point_cache=cache):
+            scene.frame_set(scene.frame_start)
+            bpy.ops.ptcache.bake(bake=True)
+
+        scene.frame_set(frame)
+
+        self.report({'INFO'}, "Baked frames {} to {}".format(
+            cache.frame_start, cache.frame_end))
+        return {'FINISHED'}
 
 
 class XR_OT_clear_recording(Operator):
@@ -481,6 +577,24 @@ class XR_PT_panel(Panel):
         col.separator()
         col.operator("wm.drive_nodegroup")
 
+        col.separator()
+        physics = col.column(align=True)
+        physics.enabled = not wm.modal_running
+        physics.label(text="Rigid Body Cache")
+        row = physics.row(align=True)
+        row.operator("wm.rigid_body_cache", text="Free", icon='TRASH').bake = False
+        row.operator("wm.rigid_body_cache", text="Bake", icon='PHYSICS').bake = True
+
+        cache = rigid_body_cache(scene)
+        if cache is None:
+            physics.label(text="No rigid body world in this scene", icon='INFO')
+        elif cache.is_baked:
+            physics.label(text="Baked frames {} to {}".format(
+                cache.frame_start, cache.frame_end), icon='CHECKMARK')
+        elif (cache.frame_start, cache.frame_end) != (scene.frame_start, scene.frame_end):
+            physics.label(text="Cache range is {} to {}, baking fixes it".format(
+                cache.frame_start, cache.frame_end), icon='ERROR')
+
         xinput_reader_empty = get_reader()
         if xinput_reader_empty is not None:
             controller_inputs = xinput_reader_empty.items()
@@ -502,6 +616,7 @@ class XR_PT_panel(Panel):
 
 classes = (
     XR_OT_monitor_controller,
+    XR_OT_rigid_body_cache,
     XR_OT_clear_recording,
     XR_OT_refresh_controllers,
     XR_OT_drive_nodegroup,
