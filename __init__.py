@@ -159,6 +159,44 @@ def insert_keyframes(reader, frame):
                                group=RECORDING_GROUP)
 
 
+def write_recording(reader, samples):
+    """Store a take's samples as f-curves, replacing the frames they land on.
+
+    Keying as the take plays is both slow and self-defeating: an animated
+    property is reset to its curve on every frame change, so the simulation
+    would step on the previous frame's input instead of the one being played.
+    """
+    frames = sorted(samples)
+    if not frames:
+        return
+
+    first, last = frames[0], frames[-1]
+
+    # Keying the first frame the ordinary way builds the action and the
+    # curves, so the rest of the take can be dropped straight into them.
+    for name, value in samples[first].items():
+        reader[name] = value
+    insert_keyframes(reader, first)
+
+    for fcurve in get_recording(reader):
+        name = RECORDED_PATHS[fcurve.data_path]
+        points = fcurve.keyframe_points
+
+        # An earlier take may already own some of these frames. Walking
+        # backwards keeps the indices of the untouched points valid.
+        for index in range(len(points) - 1, -1, -1):
+            if first < points[index].co[0] <= last:
+                points.remove(points[index], fast=True)
+
+        recorded = frames[1:]
+        offset = len(points)
+        points.add(len(recorded))
+        for index, frame in enumerate(recorded):
+            points[offset + index].co = (frame, samples[frame][name])
+
+        fcurve.update()  # sorts the keyframes back into frame order
+
+
 def apply_recorded_interpolation(reader):
     """Buttons switch from one frame to the next, sticks and triggers ramp."""
     for fcurve in reader_fcurves(reader):
@@ -231,6 +269,8 @@ class XR_OT_monitor_controller(Operator):
     _first_frame = None
     _last_frame = None
     _was_playing = False
+    _values = None
+    _samples = None
 
     def modal(self, context, event):
         xinput_reader_empty = get_reader()
@@ -241,24 +281,32 @@ class XR_OT_monitor_controller(Operator):
                 xinput_reader_empty.location = xinput_reader_empty.location
             return {'CANCELLED'}
 
-        #Controller inputs
-        values = self._gamepad.poll()
-
-        if values is not None:  # None means nothing is plugged in
-            for name, value in values.items():
-                xinput_reader_empty[name] = value
-
-            # trigger scene update
-            xinput_reader_empty.location = xinput_reader_empty.location
-
-        if self.record and self.record_frames(context, xinput_reader_empty):
+        # Sampled before the fresh values are read in: whatever is still on
+        # the reader is what the frame that just played was simulated with.
+        if self.record and self.record_frames(context):
             self.cancel(context)
             return {'FINISHED'}
 
+        self.read_gamepad(xinput_reader_empty)
+
         return {'PASS_THROUGH'}
 
-    def record_frames(self, context, xinput_reader_empty):
-        """Key the current values, returns True once the recording is done."""
+    def read_gamepad(self, xinput_reader_empty):
+        """Put the current controller values on the reader empty."""
+        values = self._gamepad.poll()
+
+        if values is None:  # None means nothing is plugged in
+            return
+
+        self._values = values
+        for name, value in values.items():
+            xinput_reader_empty[name] = value
+
+        # trigger scene update
+        xinput_reader_empty.location = xinput_reader_empty.location
+
+    def record_frames(self, context):
+        """Sample the frame that just played, returns True once the take ends."""
         scene = context.scene
         frame = scene.frame_current
 
@@ -269,7 +317,8 @@ class XR_OT_monitor_controller(Operator):
             if self._last_frame is not None and frame < self._last_frame:
                 return True  # the playback looped back around
 
-            insert_keyframes(xinput_reader_empty, frame)
+            if self._values is not None:
+                self._samples[frame] = self._values
 
             if self._first_frame is None:
                 self._first_frame = frame
@@ -299,6 +348,12 @@ class XR_OT_monitor_controller(Operator):
         self._first_frame = None
         self._last_frame = None
         self._was_playing = False
+        self._values = None
+        self._samples = {}
+
+        # The first frame of a take is played before the modal ever ticks, so
+        # it has to be given real values to simulate with.
+        self.read_gamepad(xinput_reader_empty)
 
         if self.record:
             self.start_recording(context, xinput_reader_empty)
@@ -357,6 +412,7 @@ class XR_OT_monitor_controller(Operator):
 
         xinput_reader_empty = get_reader()
         if xinput_reader_empty is not None:
+            write_recording(xinput_reader_empty, self._samples or {})
             apply_recorded_interpolation(xinput_reader_empty)
 
         if self._first_frame is not None:
